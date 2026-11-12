@@ -1,0 +1,32 @@
+{
+  "name": "devdom",
+  "version": "0.1.3",
+  "description": "Hotel-style *.dev.localhost hooks for any project folder — one command, backed by Caddy + dnsmasq",
+  "bin": {
+    "devd": "bin/devd"
+  },
+  "files": [
+    "bin",
+    "templates",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dev",
+    "localhost",
+    "domain",
+    "dev.localhost",
+    "caddy",
+    "dnsmasq",
+    "reverse-proxy",
+    "hotel",
+    "chalet",
+    "local-development"
+  ],
+  "author": "productivejaco <jaco@productive.me>",
+  "license": "MIT",
+  "os": [
+    "darwin",
+    "linux"
+  ]
+}

@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# devd — hook any project folder to <name>.dev.localhost via Caddy + dnsmasq
+# npm: devdom
+set -euo pipefail
+
+DEVDC="${DEVD_HOME:-$HOME/.devd}"
+ROUTES="$DEVDC/routes"
+# resolve $0 through npm's global bin symlink before locating the package root
+SELF_DIR="$(dirname "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")")"
+SELF_DIR="$(cd "$SELF_DIR" && pwd -P)"
+TPL="$SELF_DIR/../templates"
+
+usage() {
+  cat <<'EOF'
+devd — hook any folder to a *.dev.localhost domain
+
+Usage: devd <command> [args]
+
+  hook <port> [domain]   proxy domain → localhost:<port>
+                         (default domain: <foldername>.dev.localhost;
+                          a full domain like api.localhost passes through)
+  unhook [domain]        remove the hook (default: current folder)
+  ls                     list all hooks
+  status                 check resolver + caddy, list hooks
+  start                  sudo caddy start --config ~/.devd/Caddyfile
+  install                verify caddy + dnsmasq setup, print exact fixes
+  --version, -v          print version
+  --help, -h             this help
+
+Env:  DEVD_HOME   config dir (default ~/.devd)
+EOF
+}
+
+init() {
+  mkdir -p "$ROUTES"
+  if [ ! -f "$DEVDC/Caddyfile" ]; then
+    cat > "$DEVDC/Caddyfile" <<EOF
+{
+	admin localhost:2019
+}
+import $ROUTES/*.caddy
+EOF
+  fi
+}
+
+reload() {
+  if ! curl -s -o /dev/null http://localhost:2019/config; then
+    echo "⚠ caddy not running — run: devd start" >&2
+    return 1
+  fi
+  local err
+  if ! err="$(caddy reload --config "$DEVDC/Caddyfile" 2>&1)"; then
+    echo "⚠ caddy reload failed — route file may be invalid:" >&2
+    printf '%s\n' "$err" | sed 's/^/    /' >&2
+    return 1
+  fi
+  echo "  reloaded"
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+resolve() {
+  local d
+  d="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$d" in *.* ) ;; *) d="$d.dev.localhost" ;; esac
+  printf '%s' "$d"
+}
+
+cmd_hook() {
+  local port domain
+  if [ "${1-}" = "-h" ] || [ "${1-}" = "--help" ]; then
+    echo "usage: devd hook <port> [domain]   (or run with \$PORT set)"
+    echo "       devd hook 3000              → <foldername>.dev.localhost → localhost:3000"
+    echo "       devd hook 3001 api.localhost → explicit domain"
+    return 0
+  fi
+  port="${1:-${PORT:-}}"
+  case "$port" in
+    ''|*[!0-9]*)
+      echo "✗ '$port' is not a port number — usage: devd hook <port> [domain]" >&2
+      if printf '%s' "${1-}" | grep -q '\.'; then
+        echo "  (looks like a domain — port goes first:  devd hook 3000 ${1-})" >&2
+      elif [ -n "${PORT:-}" ]; then
+        echo "  (\$PORT is set to '$PORT' — run: devd hook)" >&2
+      fi
+      return 1 ;;
+  esac
+  [ -n "${2:-}" ] && [ -n "${3:-}" ] && { echo "✗ too many arguments — usage: devd hook <port> [domain]" >&2; return 1; }
+  domain="$(resolve "${2:-$(basename "$PWD")}")"
+  cat > "$ROUTES/$domain.caddy" <<EOF
+$domain {
+	reverse_proxy localhost:$port
+}
+EOF
+  if reload; then
+    echo "✓ $domain → localhost:$port"
+  else
+    echo "⚠ hook saved to $ROUTES/$domain.caddy but caddy config not updated — fix above, then re-run:" >&2
+    echo "      devd hook $port $domain   (or: devd unhook $domain to remove)" >&2
+    return 1
+  fi
+}
+
+cmd_unhook() {
+  local domain file
+  domain="$(resolve "${1:-$(basename "$PWD")}")"
+  file="$ROUTES/$domain.caddy"
+  if [ ! -f "$file" ]; then
+    echo "nothing hooked at $domain"
+    return 1
+  fi
+  rm -f "$file"
+  reload
+  echo "✗ unhooked $domain"
+}
+
+cmd_ls() {
+  local f any=0
+  for f in "$ROUTES"/*.caddy; do
+    [ -e "$f" ] || break
+    any=1
+    printf '%-38s → %s\n' "$(basename "${f%.caddy}")" "$(grep -oE 'localhost:[0-9]+' "$f" | head -1)"
+  done
+  [ "$any" -eq 1 ] || echo "(no hooks)"
+}
+
+cmd_status() {
+  init
+  local fail=0
+  if have dig; then
+    local dns
+    dns="$( { dig +short @127.0.0.1 -p 5754 check.devd.localhost 2>/dev/null || true; } | head -1)"
+    if [ "$dns" = "127.0.0.1" ]; then
+      echo "✓ dnsmasq resolving *.dev.localhost → 127.0.0.1"
+    else
+      echo "✗ dnsmasq not answering on 127.0.0.1:5754 (run: devd install)"
+      fail=1
+    fi
+  fi
+  if curl -s -o /dev/null http://localhost:2019/config; then
+    echo "✓ caddy admin API up (localhost:2019)"
+  else
+    echo "✗ caddy not running (run: devd start)"
+    fail=1
+  fi
+  cmd_ls
+  return "$fail"
+}
+
+cmd_start() {
+  init
+  sudo caddy start --config "$DEVDC/Caddyfile"
+}
+
+cmd_install() {
+  local conf ok=1
+  if ! have caddy; then
+    echo "✗ caddy missing        → brew install caddy"; ok=0
+  fi
+  if ! have dnsmasq; then
+    echo "✗ dnsmasq missing      → brew install dnsmasq"; ok=0
+    conf="/opt/homebrew/etc/dnsmasq.conf"
+    [ -f "$conf" ] || conf="/usr/local/etc/dnsmasq.conf"
+  else
+    conf="/opt/homebrew/etc/dnsmasq.conf"
+    [ -f "$conf" ] || conf="/usr/local/etc/dnsmasq.conf"
+    if [ -f "$conf" ] && grep -qE '^address=/.*localhost' "$conf"; then
+      echo "✓ dnsmasq has the localhost wildcard"
+    else
+      echo "✗ dnsmasq not configured → add all lines from $TPL/dnsmasq.conf"
+      echo "                            to $conf, then: brew services restart dnsmasq"
+      ok=0
+    fi
+  fi
+  if [ -f "$conf" ] && ! grep -qE '^port=5754' "$conf"; then
+    echo "! dnsmasq port          → set 'port=5754' in $conf (must not clash with system DNS)"
+    ok=0
+  fi
+  if [ -f /etc/resolver/localhost ] && grep -q 'port 5754' /etc/resolver/localhost; then
+    echo "✓ /etc/resolver/localhost routes *.localhost to dnsmasq"
+  else
+    echo "✗ missing or outdated resolver file → run:"
+    echo "    sudo mkdir -p /etc/resolver && printf 'nameserver 127.0.0.1\\nport 5754\\n' | sudo tee /etc/resolver/localhost"
+    ok=0
+  fi
+  echo "$ok" >/dev/null  # silence accidental set -e exit
+  if [ "$ok" -eq 1 ]; then
+    echo "✓ devd is fully wired up — 'devd start' next"
+  else
+    echo "apply the fixes above, then re-run: devd install"
+  fi
+}
+
+cmd_version() {
+  local v
+  v="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$SELF_DIR/../package.json" | head -1)"
+  echo "devd v${v:-?} (npm: devdom)"
+}
+
+init
+case "${1-}" in
+  hook)        shift; cmd_hook "$@" ;;
+  unhook)      shift; cmd_unhook "${1-}" ;;
+  ls)          cmd_ls ;;
+  status)      cmd_status ;;
+  start)       cmd_start ;;
+  install)     cmd_install ;;
+  --version|-v) cmd_version ;;
+  -h|--help|help|"") usage ;;
+  *) echo "unknown command: $1" >&2; usage >&2; exit 1 ;;
+esac
